@@ -1,0 +1,340 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>GSRAG Tool</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <script src="https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js"></script>
+    <style>
+      body { font-family: system-ui, Arial; margin: 0; display: grid; grid-template-columns: 380px 1fr; height: 100vh; }
+      #panel { padding: 12px; border-right: 1px solid #ddd; overflow: auto; }
+      #cy { width: 100%; height: 100%; }
+
+      button, select, input { width: 100%; margin: 6px 0; padding: 8px; box-sizing: border-box; }
+      .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+
+      label { font-size: 12px; color: #333; }
+      .hint { color: #555; font-size: 12px; line-height: 1.3; }
+      .status { padding: 10px; border-radius: 8px; margin: 10px 0; border: 1px solid #ddd; background: #fafafa; }
+      .status.ok { border-color: #86efac; background: #f0fdf4; }
+      .status.bad { border-color: #fca5a5; background: #fef2f2; }
+
+      details { border: 1px solid #eee; border-radius: 8px; padding: 8px 10px; margin: 8px 0; background: #fff; }
+      summary { cursor: pointer; font-weight: 600; }
+      .kv { display: grid; grid-template-columns: 110px 1fr; gap: 6px 10px; margin-top: 8px; }
+      .k { color: #666; font-size: 12px; }
+      .v { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
+
+      ul.mono { margin: 8px 0 0 18px; padding: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono"; font-size: 12px; }
+      .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; border: 1px solid #ddd; font-size: 12px; }
+      .pill.red { border-color: #ef4444; background: #fee2e2; }
+      .pill.green { border-color: #22c55e; background: #dcfce7; }
+
+      .small { font-size: 12px; color: #666; }
+    </style>
+  </head>
+  <body>
+    <div id="panel">
+      <h2>Graphical Simulator for Resource Allocation Graph</h2>
+
+      <div class="row">
+        <button id="addProcess">Add Process</button>
+        <button id="addResource">Add Resource</button>
+      </div>
+
+      <hr />
+
+      <label>Edge type</label>
+      <select id="edgeType">
+        <option value="request">Request (P → R)</option>
+        <option value="allocation">Allocation (R → P)</option>
+      </select>
+      <button id="connect">Connect: click 2 nodes</button>
+
+      <button id="delete">Delete selected</button>
+      <button id="layout">Auto layout</button>
+
+      <hr />
+
+      <label>API base URL</label>
+      <input id="apiBase" value="http://localhost:8000" />
+
+      <button id="analyze">Analyze deadlock</button>
+
+      <div class="hint">
+        <b>Rules</b>:
+        <ul>
+          <li><b>Request</b>: Process → Resource</li>
+          <li><b>Allocation</b>: Resource → Process</li>
+        </ul>
+      </div>
+
+      <h3>Output</h3>
+
+      <div id="statusBox" class="status">
+        <div style="display:flex; align-items:center; justify-content:space-between; gap: 8px;">
+          <div>
+            <div id="statusPill" class="pill">Not analyzed</div>
+            <div id="statusMsg" class="small" style="margin-top:6px;">Click “Analyze deadlock” to see results.</div>
+          </div>
+          <div class="small" id="cycleCount"></div>
+        </div>
+      </div>
+
+      <details open>
+        <summary>Message</summary>
+        <div class="kv">
+          <div class="k">message</div>
+          <div class="v" id="msgText">—</div>
+        </div>
+      </details>
+
+      <details>
+        <summary>Deadlock cycles</summary>
+        <div class="small">Each cycle is shown as an ordered list of edges (u → v).</div>
+        <div id="cycles"></div>
+      </details>
+
+      <details>
+        <summary>Highlights</summary>
+        <div class="kv">
+          <div class="k">nodes</div>
+          <div class="v" id="hlNodes">—</div>
+          <div class="k">edges</div>
+          <div class="v" id="hlEdges">—</div>
+        </div>
+      </details>
+    </div>
+
+    <div id="cy"></div>
+
+    <script>
+      let procCount = 0;
+      let resCount = 0;
+
+      const cy = cytoscape({
+        container: document.getElementById("cy"),
+        elements: [],
+        style: [
+          {
+            selector: "node",
+            style: {
+              "label": "data(label)",
+              "text-valign": "center",
+              "color": "#111",
+              "border-width": 2,
+              "width": 62,
+              "height": 62,
+              "font-size": 12,
+              "text-wrap": "wrap",
+              "text-max-width": 90
+            }
+          },
+          {
+            selector: "node[type='process']",
+            style: { "shape": "ellipse", "background-color": "#b3d4ff", "border-color": "#3b82f6" }
+          },
+          {
+            selector: "node[type='resource']",
+            style: { "shape": "round-rectangle", "background-color": "#bbf7d0", "border-color": "#22c55e" }
+          },
+          {
+            selector: "edge",
+            style: {
+              "curve-style": "bezier",
+              "target-arrow-shape": "triangle",
+              "line-color": "#666",
+              "target-arrow-color": "#666",
+              "width": 2,
+              "label": "data(type)",
+              "font-size": 10,
+              "text-rotation": "autorotate",
+              "text-margin-y": -10
+            }
+          },
+          { selector: ".highlighted", style: { "background-color": "#fecaca", "line-color": "#ef4444", "target-arrow-color": "#ef4444", "border-color": "#ef4444" } }
+        ],
+        layout: { name: "grid" }
+      });
+
+      function addNode(type) {
+        if (type === "process") {
+          procCount++;
+          const id = `P${procCount}`;
+          cy.add({ group: "nodes", data: { id, type, label: id } });
+        } else {
+          resCount++;
+          const id = `R${resCount}`;
+          cy.add({ group: "nodes", data: { id, type, label: id } });
+        }
+        cy.layout({ name: "grid", animate: true }).run();
+      }
+
+      document.getElementById("addProcess").onclick = () => addNode("process");
+      document.getElementById("addResource").onclick = () => addNode("resource");
+
+      let connectMode = false;
+      let firstNode = null;
+
+      document.getElementById("connect").onclick = () => {
+        connectMode = true;
+        firstNode = null;
+        document.getElementById("connect").textContent = "Connecting... click 2 nodes";
+      };
+
+      cy.on("tap", "node", (evt) => {
+        if (!connectMode) return;
+        const n = evt.target;
+
+        if (!firstNode) {
+          firstNode = n;
+          return;
+        }
+
+        const secondNode = n;
+        const type = document.getElementById("edgeType").value;
+
+        cy.add({
+          group: "edges",
+          data: {
+            id: `${firstNode.id()}_${secondNode.id()}_${type}_${Date.now()}`,
+            source: firstNode.id(),
+            target: secondNode.id(),
+            type
+          }
+        });
+
+        connectMode = false;
+        firstNode = null;
+        document.getElementById("connect").textContent = "Connect: click 2 nodes";
+      });
+
+      document.getElementById("delete").onclick = () => cy.$(":selected").remove();
+      document.getElementById("layout").onclick = () => cy.layout({ name: "cose", animate: true }).run();
+
+      function toApiGraph() {
+        const nodes = cy.nodes().map(n => ({
+          id: n.id(),
+          type: n.data("type")
+        }));
+
+        const edges = cy.edges().map(e => ({
+          source: e.source().id(),
+          target: e.target().id(),
+          type: e.data("type")
+        }));
+
+        return { nodes, edges };
+      }
+
+      function clearHighlights() {
+        cy.nodes().removeClass("highlighted");
+        cy.edges().removeClass("highlighted");
+      }
+
+      function applyHighlights(payload) {
+        clearHighlights();
+        const hn = (payload.highlight && payload.highlight.nodes) || [];
+        const he = (payload.highlight && payload.highlight.edges) || [];
+        hn.forEach(id => cy.getElementById(id).addClass("highlighted"));
+        he.forEach(ed => {
+          cy.edges().forEach(e => {
+            if (e.source().id() === ed.source && e.target().id() === ed.target && e.data("type") === ed.type) {
+              e.addClass("highlighted");
+            }
+          });
+        });
+      }
+
+      function fmtEdges(edgeList) {
+        // edgeList is [{source,target,type}, ...]
+        return edgeList.map(e => `${e.source} → ${e.target} (${e.type})`).join(", ");
+      }
+
+      function renderOutput(payload) {
+        // Status box
+        const statusBox = document.getElementById("statusBox");
+        const statusPill = document.getElementById("statusPill");
+        const statusMsg = document.getElementById("statusMsg");
+        const cycleCount = document.getElementById("cycleCount");
+
+        const isError = (payload.message || "").startsWith("Error:");
+        const isDeadlock = payload.deadlock === true;
+
+        statusBox.classList.remove("ok", "bad");
+        if (isError || isDeadlock) statusBox.classList.add("bad");
+        else statusBox.classList.add("ok");
+
+        if (isError) {
+          statusPill.className = "pill red";
+          statusPill.textContent = "Error";
+        } else if (isDeadlock) {
+          statusPill.className = "pill red";
+          statusPill.textContent = "Deadlock";
+        } else {
+          statusPill.className = "pill green";
+          statusPill.textContent = "No deadlock";
+        }
+
+        statusMsg.textContent = payload.message || "—";
+
+        const cycles = payload.deadlock_cycles || [];
+        cycleCount.textContent = `cycles: ${cycles.length}`;
+
+        // Message section
+        document.getElementById("msgText").textContent = payload.message || "—";
+
+        // Cycles section
+        const cyclesDiv = document.getElementById("cycles");
+        cyclesDiv.innerHTML = "";
+        if (!cycles.length) {
+          cyclesDiv.innerHTML = `<div class="small">No cycles to show.</div>`;
+        } else {
+          cycles.forEach((cyc, idx) => {
+            const ul = document.createElement("ul");
+            ul.className = "mono";
+            // cyc is list of [u,v]
+            cyc.forEach(([u, v]) => {
+              const li = document.createElement("li");
+              li.textContent = `${u} → ${v}`;
+              ul.appendChild(li);
+            });
+
+            const block = document.createElement("details");
+            block.open = (idx === 0);
+            const sum = document.createElement("summary");
+            sum.textContent = `Cycle #${idx + 1} (${cyc.length} edges)`;
+            block.appendChild(sum);
+            block.appendChild(ul);
+            cyclesDiv.appendChild(block);
+          });
+        }
+
+        // Highlight section
+        const hn = (payload.highlight && payload.highlight.nodes) || [];
+        const he = (payload.highlight && payload.highlight.edges) || [];
+
+        document.getElementById("hlNodes").textContent = hn.length ? hn.join(", ") : "—";
+        document.getElementById("hlEdges").textContent = he.length ? fmtEdges(he) : "—";
+      }
+
+      document.getElementById("analyze").onclick = async () => {
+        const apiBase = document.getElementById("apiBase").value.replace(/\/+$/, "");
+        const graph = toApiGraph();
+
+        // optimistic UI
+        renderOutput({ deadlock: false, message: "Analyzing...", deadlock_cycles: [], highlight: {nodes:[], edges:[]} });
+
+        const res = await fetch(`${apiBase}/analyze`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(graph)
+        });
+
+        const payload = await res.json();
+        applyHighlights(payload);
+        renderOutput(payload);
+      };
+    </script>
+  </body>
+</html>
